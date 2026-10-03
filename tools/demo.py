@@ -207,7 +207,13 @@ def image_demo(predictor, vis_folder, path, current_time, save_result):
 
 
 def imageflow_demo(predictor, vis_folder, current_time, args):
-    cap = cv2.VideoCapture(args.path if args.demo == "video" else args.camid)
+    if args.demo == "video":
+        cap = cv2.VideoCapture(args.path)
+    elif os.name == "nt":
+        # DirectShow opens webcams reliably on Windows.
+        cap = cv2.VideoCapture(args.camid, cv2.CAP_DSHOW)
+    else:
+        cap = cv2.VideoCapture(args.camid)
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -280,7 +286,8 @@ def main(exp, args):
         else:
             ckpt_file = args.ckpt
         logger.info("loading checkpoint")
-        ckpt = torch.load(ckpt_file, map_location="cpu")
+        # weights_only=False is required for the official YOLOX checkpoint format.
+        ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
         # load the model state dict
         model.load_state_dict(ckpt["model"])
         logger.info("loaded checkpoint done.")

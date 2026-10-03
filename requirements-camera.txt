@@ -1,0 +1,12 @@
+# Runtime for camera.py. Install these into .venv only.
+# torch and torchvision come from the PyTorch CPU index, not PyPI:
+#   python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+numpy
+opencv-python
+loguru
+tqdm
+psutil
+packaging
+pycocotools
+tabulate
+thop

@@ -1,3 +1,7 @@
+## Using this copy
+
+This folder is a local YOLOX checkout with a webcam window and a license-plate reader. Python packages stay in `.venv` inside the folder. How to run it, where to put photos, and what each script does is documented in [docs/usage.md](docs/usage.md).
+
 <div align="center"><img src="assets/logo.png" width="350"></div>
 <img src="assets/demo.png" >
 

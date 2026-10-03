@@ -1,0 +1,3 @@
+# Plate reading, installed into .venv only.
+# Uses the Windows OCR engine, so no extra model download is required.
+winocr
