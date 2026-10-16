@@ -2,7 +2,7 @@
 
 This folder is a local copy of [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) plus a webcam window and a license-plate reader. Everything it installs or writes stays inside this folder: the virtual environment, model weights, caches, and output images.
 
-The detector is the pretrained YOLOX-S model. It finds everyday objects such as cars and trucks. It does not read text. Plate numbers and issuing locations come from Windows OCR in `read_plate.py`. The location is the state or county printed on the plate, not a GPS position.
+The pipeline is focused strictly on license plates. It locates rectangular plate regions with fast OpenCV morphology (and fused YOLOX vehicle-crop fallback), applies image enhancement (mud/stain suppression, LAB CLAHE contrast balancing, bilateral denoising, gamma midtone darkening, and unsharp masking), and reads all printed plate contents with the local Windows OCR engine in `read_plate.py`. Nothing is downloaded from outside this folder.
 
 ## Run the camera
 
