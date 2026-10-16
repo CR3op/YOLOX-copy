@@ -1,6 +1,15 @@
-## Using this copy
+## Using this copy (License Plate Detection, Image Enhancement, Confidence Scoring & OCR)
 
-This folder is a local YOLOX checkout with a webcam window and a license-plate reader. Python packages stay in `.venv` inside the folder. How to run it, where to put photos, and what each script does is documented in [docs/usage.md](docs/usage.md).
+This repository is a self-contained computer vision project built on YOLOX, OpenCV, and Windows native OCR (`winocr`). Everything it uses or writes (`.venv`, `weights/yolox_s.pth`, `.cache`, `datasets/plates`, `datasets/plate_feedback.json`, and `YOLOX_outputs`) stays strictly inside this folder with zero external downloads at runtime.
+
+### Key Highlights
+- **Focused Strictly on License Plates**: Ignores unrelated COCO object classes and locates rectangular license plate regions directly using a **~1.6–2.1 ms** OpenCV morphological/gradient detector (`detect_plate_regions`), backed by a fused YOLOX vehicle-crop fallback (`car`, `truck`, `bus`, `motorcycle`).
+- **20 FPS → ~600 FPS Live Camera Performance**: By replacing per-frame unfused 640×640 YOLOX inference (`~89 ms/frame`) with fast OpenCV plate localization on 7 out of 8 frames, fusing Conv+BN layers at 416×416 (`fuse_model`) with `torch.inference_mode()`, and running cached WinRT OCR (`~22 ms/crop`) on a background thread (`PlateWatcher`), normal camera frames render in **~1.6 ms (~500–600 FPS)**.
+- **Image Enhancement for Muddy / Low-Contrast Plates**: Suppresses warm brown mud splatters, balances luminance with LAB percentile stretching and CLAHE, denoises with bilateral filtering, darkens faded midtone ink, and applies unsharp masking. Saves both `*_enhanced.jpg` and annotated `*.jpg` outputs to `YOLOX_outputs/plates/`.
+- **Full Plate Content Recognition**: Extracts the **plate number** (`291-764M`), **issuing state & county** (`Starr County, Texas`), **plate type** (`Trailer`), **state slogan** (`The Lone Star State`), **sticker expiration** (`11/25`), and **registration sticker serials** (`31001425, 96764981, 690361K`).
+- **Confidence Scoring & Human-in-the-Loop Learning**: Computes a **0–100% accuracy confidence score** across 5 factors (multi-pass OCR agreement, plate format validity, contextual contents match, visual clarity/contrast, and human verification). Confirm (`.\run_plate.bat --confirm` or **`Y`** in camera), reject (`--reject` or **`N`** in camera), or teach (`--teach "291-764M"`) readings to train `datasets/plate_feedback.json` to repair noisy OCR frames, backfill blurry text, and adapt enhancement pass weights.
+
+Run `.\run_plate.bat` for still photos or `.\run_camera.bat` for the live webcam reader. Full architecture, enhancement pipeline, confidence scoring, human-feedback learning, and benchmark details are documented in [docs/usage.md](docs/usage.md).
 
 <div align="center"><img src="assets/logo.png" width="350"></div>
 <img src="assets/demo.png" >

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Live webcam license-plate detector and reader.
+"""Live webcam license-plate detector, confidence scorer, and human-feedback learner.
 
 Focuses strictly on locating license plates, enhancing the plate image,
-and reading all of the contents printed on the plate (plate number,
-issuing state/county, plate type, slogan, and registration sticker info).
+reading all printed contents, computing an accuracy confidence score, and
+learning from human intervention (press Y to confirm or N to reject).
 Plate reading runs on a background thread so the video feed stays fast.
 
 Everything this script reads or writes stays inside this project folder.
 """
 
 import argparse
+from collections import deque
 import os
 import sys
 import threading
@@ -67,10 +68,7 @@ def parse_args():
 
 
 def resolve_inside_project(path):
-    """Turn a checkpoint path into an absolute path inside this folder.
-
-    Paths outside the project are rejected so weights and outputs stay local.
-    """
+    """Turn a checkpoint path into an absolute path inside this folder."""
     resolved = Path(path).expanduser()
     if not resolved.is_absolute():
         resolved = ROOT / resolved
@@ -81,12 +79,7 @@ def resolve_inside_project(path):
 
 
 def open_camera(cam_id):
-    """Open a webcam and return it after the first real frame arrives.
-
-    On Windows, DirectShow is tried first, then Media Foundation. A backend
-    can report that it opened and still deliver no picture, so each one is
-    checked with an actual read.
-    """
+    """Open a webcam and return it after the first real frame arrives."""
     backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY] if os.name == "nt" else [cv2.CAP_ANY]
     for backend in backends:
         cap = cv2.VideoCapture(cam_id, backend)
@@ -104,11 +97,7 @@ def open_camera(cam_id):
 
 
 def load_model(name, ckpt_path, conf, nms, device):
-    """Build a YOLOX detector, load weights, and fuse Conv+BN layers for faster inference.
-
-    Uses a 416x416 test size and fused layers so vehicle-assisted plate crops
-    run more than 2x faster on CPU while keeping everything local.
-    """
+    """Build a YOLOX detector, load weights, and fuse Conv+BN layers for faster inference."""
     exp = get_exp(None, name)
     exp.test_conf = conf
     exp.nmsthre = nms
@@ -128,8 +117,6 @@ def load_model(name, ckpt_path, conf, nms, device):
     return model, exp
 
 
-# COCO classes that can carry a license plate. Unrelated classes (people, chairs, etc.)
-# are ignored so the model stays focused only on license plates.
 VEHICLE_NAMES = {"car", "truck", "bus", "motorcycle"}
 
 
@@ -171,11 +158,7 @@ def detect_vehicles(model, exp, frame, preproc, device):
 
 
 def analyze(model, exp, frame, preproc, device, run_vehicle_pass=False):
-    """Focus only on license plate regions without drawing unrelated COCO objects.
-
-    Fast OpenCV plate-region detection runs in ~2 ms per frame. YOLOX vehicle
-    detection runs only when requested so the live camera feed stays smooth.
-    """
+    """Focus only on license plate regions without drawing unrelated COCO objects."""
     from read_plate import detect_plate_regions
 
     drawn = frame.copy()
@@ -185,20 +168,30 @@ def analyze(model, exp, frame, preproc, device, run_vehicle_pass=False):
 
 
 class PlateWatcher:
-    """Enhance and read license plates on a background thread so video stays smooth."""
+    """Enhance, score, and read license plates on a background thread with human feedback."""
 
     def __init__(self):
         """Start the background plate reader."""
-        from read_plate import enhance_plate_image, read_plate_in_frame
+        from read_plate import (
+            compute_confidence,
+            enhance_plate_image,
+            read_plate_in_frame,
+            record_human_feedback,
+        )
 
         self._read = read_plate_in_frame
         self._enhance = enhance_plate_image
+        self._feedback_fn = record_human_feedback
+        self._compute_conf = compute_confidence
         self._lock = threading.Lock()
         self._pending = None
         self._stop = False
         self.reading = None
         self.enhanced_crop = None
         self.updated = 0.0
+        self.feedback_banner = None
+        self.feedback_banner_time = 0.0
+        self._recent_tokens = deque(maxlen=12)
         self._announced = None
         self._thread = threading.Thread(target=self._loop, name="plate-reader", daemon=True)
         self._thread.start()
@@ -210,13 +203,48 @@ class PlateWatcher:
                 self._pending = (frame.copy(), list(vehicles))
 
     def snapshot(self):
-        """Return (reading, enhanced_crop), or (None, None) once older than 8 seconds."""
+        """Return (reading, enhanced_crop, feedback_banner)."""
         with self._lock:
-            if self.reading is None:
-                return None, None
-            if time.perf_counter() - self.updated > 8:
-                return None, None
-            return self.reading, self.enhanced_crop
+            banner = None
+            if self.feedback_banner and time.perf_counter() - self.feedback_banner_time < 5.0:
+                banner = self.feedback_banner
+            if self.reading is None or time.perf_counter() - self.updated > 8:
+                return None, None, banner
+            return self.reading, self.enhanced_crop, banner
+
+    def apply_human_feedback(self, is_correct):
+        """Record human confirmation (Y) or rejection (N) for the active plate reading."""
+        with self._lock:
+            current = dict(self.reading) if self.reading else None
+            recent = list(self._recent_tokens)
+        if not current or not current.get("normalized"):
+            with self._lock:
+                self.feedback_banner = "No active plate reading to confirm or reject yet."
+                self.feedback_banner_time = time.perf_counter()
+            return
+
+        extra_items = list(current.get("all_items") or [])
+        for tok in recent:
+            extra_items.append({"text": tok})
+        _, msg = self._feedback_fn(current, items=extra_items, is_correct=is_correct)
+        print(f"[Human Feedback] {msg}")
+
+        with self._lock:
+            self.feedback_banner = msg
+            self.feedback_banner_time = time.perf_counter()
+            if not is_correct:
+                self.reading = None
+                self.enhanced_crop = None
+                self._announced = None
+            elif self.reading:
+                self.reading["human_confirmations"] = int(self.reading.get("human_confirmations", 0)) + 1
+                conf, level, details = self._compute_conf(
+                    self.reading, self.reading.get("all_items") or []
+                )
+                self.reading["confidence"] = conf
+                self.reading["confidence_level"] = level
+                self.reading["confidence_details"] = details
+                self.updated = time.perf_counter()
 
     def stop(self):
         """Ask the reader thread to exit and wait briefly for it."""
@@ -256,21 +284,48 @@ class PlateWatcher:
             enhanced_preview = self._enhance(crop)
 
             with self._lock:
+                self._recent_tokens.append(reading.get("raw_ocr_number") or reading["number"])
+                # Keep higher-confidence reading if the same plate was just read a moment ago
+                if (
+                    self.reading
+                    and time.perf_counter() - self.updated < 2.5
+                    and self.reading.get("normalized") == reading["normalized"]
+                    and self.reading.get("confidence", 0.0) > reading.get("confidence", 0.0)
+                ):
+                    reading["confidence"] = self.reading["confidence"]
+                    reading["confidence_level"] = self.reading["confidence_level"]
                 self.reading = reading
                 self.enhanced_crop = enhanced_preview
                 self.updated = time.perf_counter()
+
             if reading["normalized"] != self._announced:
                 self._announced = reading["normalized"]
                 from read_plate import location_text
 
                 place = location_text(reading) or "location not printed clearly"
                 contents = " | ".join(reading.get("contents") or [])
-                print(f"Plate {reading['number']} | {place} | Contents: {contents}")
+                conf = reading.get("confidence", 0.0)
+                level = reading.get("confidence_level", "")
+                print(
+                    f"Plate {reading['number']} | Confidence: {conf:.1f}% ({level}) | "
+                    f"{place} | Contents: {contents}"
+                )
 
 
-def paint_plate(frame, reading, enhanced_crop=None, candidate_boxes=None):
-    """Draw only license plate boxes, recognized plate contents, and the enhanced plate inset."""
+def paint_plate(frame, reading, enhanced_crop=None, candidate_boxes=None, feedback_banner=None):
+    """Draw license plate boxes, confidence score, contents, and human feedback controls."""
     from read_plate import location_text
+
+    fh, fw = frame.shape[:2]
+    _label(
+        frame,
+        "Human Feedback: [Y] Confirm Correct   [N] Reject Wrong   [Q] Quit",
+        (10, fh - 14),
+        scale=0.58,
+        color=(200, 230, 255),
+    )
+    if feedback_banner:
+        _label(frame, feedback_banner, (10, fh - 46), scale=0.62, color=(100, 255, 180))
 
     if reading is None:
         for x0, y0, x1, y1 in (candidate_boxes or [])[:2]:
@@ -291,7 +346,9 @@ def paint_plate(frame, reading, enhanced_crop=None, candidate_boxes=None):
         y1 = int(max(item["y"] + item["h"] for item in items))
         cv2.rectangle(frame, (x0, y0), (x1, y1), (80, 220, 80), 3)
 
-    parts = [reading["number"]]
+    conf = reading.get("confidence", 0.0)
+    level = reading.get("confidence_level", "")
+    parts = [f"{reading['number']} ({conf:.1f}% {level})"]
     if reading.get("plate_type"):
         parts.append(reading["plate_type"])
     place = location_text(reading)
@@ -310,14 +367,15 @@ def paint_plate(frame, reading, enhanced_crop=None, candidate_boxes=None):
         _label(frame, "  |  ".join(details), (10, 112), scale=0.65)
 
     if enhanced_crop is not None and enhanced_crop.size > 0:
-        fh, fw = frame.shape[:2]
         thumb_w = min(260, int(fw * 0.28))
         thumb_h = max(40, int(enhanced_crop.shape[0] * (thumb_w / max(enhanced_crop.shape[1], 1))))
         if thumb_h + 40 < fh and thumb_w + 20 < fw:
             thumb = cv2.resize(enhanced_crop, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
             x0 = fw - thumb_w - 12
             y0 = 36
-            cv2.rectangle(frame, (x0 - 3, y0 - 22), (x0 + thumb_w + 3, y0 + thumb_h + 3), (0, 0, 0), -1)
+            cv2.rectangle(
+                frame, (x0 - 3, y0 - 22), (x0 + thumb_w + 3, y0 + thumb_h + 3), (0, 0, 0), -1
+            )
             cv2.putText(
                 frame,
                 "Enhanced Plate",
@@ -332,7 +390,7 @@ def paint_plate(frame, reading, enhanced_crop=None, candidate_boxes=None):
     return frame
 
 
-def _label(frame, text, origin, scale=0.8):
+def _label(frame, text, origin, scale=0.8, color=(80, 220, 80)):
     """Draw one line of text on a black background so it stays readable."""
     font = cv2.FONT_HERSHEY_SIMPLEX
     thickness = 2
@@ -345,7 +403,7 @@ def _label(frame, text, origin, scale=0.8):
         (0, 0, 0),
         -1,
     )
-    cv2.putText(frame, text, (x, y), font, scale, (80, 220, 80), thickness)
+    cv2.putText(frame, text, (x, y), font, scale, color, thickness)
 
 
 def main():
@@ -378,7 +436,10 @@ def main():
         )
         print(f"Saving video to {out_path}")
 
-    print("Camera is open. Point it at a license plate. Press q or Esc to quit.")
+    print(
+        "Camera is open. Point it at a license plate.\n"
+        "Press Y to confirm a reading, N to reject a wrong reading, or Q / Esc to quit."
+    )
     watcher = PlateWatcher()
     frame_idx = 0
     last_vehicles = []
@@ -390,7 +451,7 @@ def main():
                 break
 
             started = time.perf_counter()
-            run_vehicle_pass = (frame_idx % 8 == 0)
+            run_vehicle_pass = frame_idx % 8 == 0
             result, candidates, vehicles = analyze(
                 model, exp, frame, preproc, args.device, run_vehicle_pass=run_vehicle_pass
             )
@@ -408,8 +469,8 @@ def main():
                 (0, 255, 0),
                 2,
             )
-            reading, enhanced_crop = watcher.snapshot()
-            paint_plate(result, reading, enhanced_crop, candidates)
+            reading, enhanced_crop, feedback_banner = watcher.snapshot()
+            paint_plate(result, reading, enhanced_crop, candidates, feedback_banner)
             if writer is not None:
                 writer.write(result)
             cv2.imshow(window, result)
@@ -417,6 +478,10 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")):
                 break
+            if key in (ord("y"), ord("Y")):
+                watcher.apply_human_feedback(is_correct=True)
+            elif key in (ord("n"), ord("N")):
+                watcher.apply_human_feedback(is_correct=False)
     finally:
         watcher.stop()
         cap.release()

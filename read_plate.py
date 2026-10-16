@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Read a license plate and all of its printed contents with image enhancement.
+"""Read a license plate, compute a confidence score, and learn from human feedback.
 
 Put plate photos in datasets/plates, or pass an image path inside this
 project. Photos already sitting in datasets/ are read too. Reading uses
-the local Windows OCR engine and OpenCV image enhancement so everything
+the local Windows OCR engine, OpenCV image enhancement, and a local
+human-feedback memory file (datasets/plate_feedback.json) so everything
 stays inside this folder and nothing is downloaded from outside.
 """
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import sys
@@ -30,6 +32,7 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 # Photos in datasets/plates are the intended drop folder. Top-level files in
 # datasets/ are included so a picture placed there is still read.
 PLATE_DIRS = [ROOT / "datasets" / "plates", ROOT / "datasets"]
+FEEDBACK_PATH = ROOT / "datasets" / "plate_feedback.json"
 
 # Names printed on US plates. Matched against OCR text to decide the issuing state.
 STATE_NAMES = {
@@ -195,21 +198,58 @@ TEXAS_COUNTIES = {
     "MCLENNAN": "McLennan County",
 }
 
+# Visual character confusion groups common in license-plate OCR under mud or motion blur.
+OCR_CONFUSION_GROUPS = [
+    set("0OQDC"),
+    set("1ILT74/"),
+    set("2Z"),
+    set("5S"),
+    set("6GB80"),
+    set("8BR"),
+    set("MNHKWR"),
+]
+
+DEFAULT_PASS_WEIGHTS = {
+    "full_raw": 1.0,
+    "band_raw": 1.0,
+    "band_soft_clahe": 1.0,
+    "sub_dark_ink": 1.0,
+    "sticker_raw": 1.0,
+}
+
 _OCR_LOCK = threading.Lock()
 _OCR_ENGINE = None
 _OCR_LOOP = None
 _CACHED_DETECTOR = None
+_FEEDBACK_LOCK = threading.Lock()
 
 
 def parse_args():
-    """Read optional image paths from the command line."""
+    """Read command-line options for plate reading and human-in-the-loop feedback."""
     parser = argparse.ArgumentParser(
-        description="Enhance a license plate image and read all of its contents locally."
+        description="Enhance a license plate image, compute confidence, and learn from human feedback."
     )
     parser.add_argument(
         "images",
         nargs="*",
         help="image paths inside this project. Default: photos in datasets/plates and datasets/",
+    )
+    parser.add_argument(
+        "--confirm",
+        "-y",
+        action="store_true",
+        help="confirm that the detected plate reading is accurate so the algorithm learns from it",
+    )
+    parser.add_argument(
+        "--reject",
+        "-n",
+        action="store_true",
+        help="mark the detected plate number as incorrect so the algorithm suppresses that token",
+    )
+    parser.add_argument(
+        "--teach",
+        metavar="PLATE_NUMBER",
+        help="teach the algorithm the true plate number (e.g. --teach 291-764M)",
     )
     return parser.parse_args()
 
@@ -223,6 +263,83 @@ def resolve_inside_project(path):
     if ROOT != resolved and ROOT not in resolved.parents:
         raise SystemExit(f"Refusing to read a path outside this folder: {resolved}")
     return resolved
+
+
+def load_feedback():
+    """Load the local human-feedback memory file from datasets/plate_feedback.json."""
+    default = {
+        "verified_plates": {},
+        "rejected_tokens": {},
+        "pass_weights": dict(DEFAULT_PASS_WEIGHTS),
+    }
+    with _FEEDBACK_LOCK:
+        if not FEEDBACK_PATH.is_file():
+            return default
+        try:
+            data = json.loads(FEEDBACK_PATH.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return default
+            data.setdefault("verified_plates", {})
+            data.setdefault("rejected_tokens", {})
+            weights = dict(DEFAULT_PASS_WEIGHTS)
+            weights.update(data.get("pass_weights") or {})
+            data["pass_weights"] = weights
+            return data
+        except Exception:
+            return default
+
+
+def save_feedback(feedback):
+    """Save updated human-feedback learning data inside datasets/plate_feedback.json."""
+    with _FEEDBACK_LOCK:
+        FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        FEEDBACK_PATH.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
+
+
+def _char_similarity(char_a, char_b):
+    """Return 1.0 for identical characters, 0.85 for known OCR look-alikes, else 0.0."""
+    if char_a == char_b:
+        return 1.0
+    for group in OCR_CONFUSION_GROUPS:
+        if char_a in group and char_b in group:
+            return 0.85
+    return 0.0
+
+
+def _collapse_ocr_splits(token):
+    """Normalize common multi-stroke OCR splits (such as trailing '11'/'I1' for 'M')."""
+    cleaned = re.sub(r"[^A-Z0-9]", "", token.upper())
+    cleaned = re.sub(r"(11|I1|1I|II|MI)$", "M", cleaned)
+    if len(cleaned) == 8 and re.match(r"^[A-Z17]\d{3}\d{3}[A-Z0-9]$", cleaned):
+        cleaned = cleaned[1:]
+    if len(cleaned) == 8 and re.match(r"^\d{3}[01479IS]\d{3}[A-Z0-9]$", cleaned):
+        cleaned = cleaned[:3] + cleaned[4:]
+    return cleaned
+
+
+def ocr_similarity(candidate, target):
+    """Compute OCR visual similarity in [0.0, 1.0] between two plate strings."""
+    cand = _collapse_ocr_splits(candidate)
+    targ = _collapse_ocr_splits(target)
+    if not cand or not targ:
+        return 0.0
+    if cand == targ:
+        return 1.0
+    len_c, len_t = len(cand), len(targ)
+    dp = [[0.0] * (len_t + 1) for _ in range(len_c + 1)]
+    for i in range(1, len_c + 1):
+        dp[i][0] = float(i)
+    for j in range(1, len_t + 1):
+        dp[0][j] = float(j)
+    for i in range(1, len_c + 1):
+        for j in range(1, len_t + 1):
+            sub_cost = 1.0 - _char_similarity(cand[i - 1], targ[j - 1])
+            dp[i][j] = min(
+                dp[i - 1][j] + 1.0,
+                dp[i][j - 1] + 1.0,
+                dp[i - 1][j - 1] + sub_cost,
+            )
+    return max(0.0, 1.0 - (dp[len_c][len_t] / max(len_c, len_t)))
 
 
 def discover_images():
@@ -353,7 +470,9 @@ def _recognize_bgr(bgr_image):
         return words
 
 
-def ocr_region(image, x0, y0, x1, y1, target_width, priority=1, enhance=None, pad=0):
+def ocr_region(
+    image, x0, y0, x1, y1, target_width, priority=1.0, enhance=None, pad=0, pass_name="raw"
+):
     """Read words in one crop (with optional enhancement) and map boxes to the full image."""
     height, width = image.shape[:2]
     x0, y0 = max(0, int(x0)), max(0, int(y0))
@@ -391,51 +510,86 @@ def ocr_region(image, x0, y0, x1, y1, target_width, priority=1, enhance=None, pa
                 "w": float(rw) / scale,
                 "h": float(rh) / scale,
                 "cy": y0 + (adj_y + float(rh) / 2.0) / scale,
-                "priority": priority,
+                "priority": float(priority),
+                "pass_name": pass_name,
             }
         )
     return items
 
 
 def dedupe(items):
-    """Drop repeated words that came from overlapping crops of the same text."""
+    """Merge repeated words from overlapping crops while tracking multi-pass OCR agreement."""
     kept = []
     for item in sorted(
-        items, key=lambda entry: (entry.get("priority", 1), entry["h"]), reverse=True
+        items, key=lambda entry: (entry.get("priority", 1.0), entry["h"]), reverse=True
     ):
         token = compact(item["text"])
         if not token:
             continue
+        pass_name = item.get("pass_name", "raw")
         duplicate = False
         for other in kept:
             same_text = token == compact(other["text"])
             same_row = abs(item["cy"] - other["cy"]) <= max(item["h"], other["h"])
             if same_text and same_row:
+                other["passes"].add(pass_name)
+                other["agreement_count"] = len(other["passes"])
                 duplicate = True
                 break
         if not duplicate:
-            kept.append(item)
+            copied = dict(item)
+            copied["passes"] = {pass_name}
+            copied["agreement_count"] = 1
+            kept.append(copied)
     return kept
 
 
-def read_text(image):
-    """OCR the whole plate plus enhanced bands for the number, plate type, and sticker."""
+def read_text(image, feedback=None):
+    """OCR the whole plate plus enhanced bands, weighted by learned pass performance."""
+    if feedback is None:
+        feedback = load_feedback()
+    weights = feedback.get("pass_weights") or DEFAULT_PASS_WEIGHTS
     height, width = image.shape[:2]
     band_width = 1000 if width >= 700 else 500
     passes = [
         # Full plate overview (captures state name, plate number, and bottom slogan)
-        (0, 0, width, height, 700, 2, None, 0),
+        ("full_raw", 0, 0, width, height, 700, 2.0, None, 0),
         # Center number band (raw and contrast/denoise enhanced for dark/washed-out/muddy plates)
-        (0, height * 0.35, width, height * 0.78, band_width, 3, None, 0),
-        (0, height * 0.35, width, height * 0.78, band_width, 3, _enhance_soft, 0),
+        ("band_raw", 0, height * 0.35, width, height * 0.78, band_width, 3.0, None, 0),
+        (
+            "band_soft_clahe",
+            0,
+            height * 0.35,
+            width,
+            height * 0.78,
+            band_width,
+            3.0,
+            _enhance_soft,
+            0,
+        ),
         # Sub-header band with dark-ink gamma enhancement (recovers mud-covered 'TRAILER' etc.)
-        (width * 0.32, height * 0.21, width * 0.64, height * 0.40, 800, 1, _enhance_dark_ink, 30),
+        (
+            "sub_dark_ink",
+            width * 0.32,
+            height * 0.21,
+            width * 0.64,
+            height * 0.40,
+            800,
+            1.0,
+            _enhance_dark_ink,
+            30,
+        ),
         # Registration sticker corner (captures county name, expiration year, and serial numbers)
-        (width * 0.58, 0, width, height * 0.46, 900, 1, None, 0),
+        ("sticker_raw", width * 0.58, 0, width, height * 0.46, 900, 1.0, None, 0),
     ]
     items = []
-    for x0, y0, x1, y1, target_width, priority, enhance_fn, pad in passes:
-        items.extend(ocr_region(image, x0, y0, x1, y1, target_width, priority, enhance_fn, pad))
+    for pass_name, x0, y0, x1, y1, target_width, base_pri, enhance_fn, pad in passes:
+        effective_pri = base_pri * float(weights.get(pass_name, 1.0))
+        items.extend(
+            ocr_region(
+                image, x0, y0, x1, y1, target_width, effective_pri, enhance_fn, pad, pass_name
+            )
+        )
     return dedupe(items)
 
 
@@ -473,7 +627,6 @@ def detect_plate_regions(frame):
         aspect = cw / float(ch)
         if not 1.3 <= aspect <= 5.8:
             continue
-        # Ignore boxes that already cover the whole frame
         if cw > small.shape[1] * 0.88 and ch > small.shape[0] * 0.82:
             continue
         pad_x = int(cw * 0.06)
@@ -554,6 +707,9 @@ def find_state_and_slogan(rows, items):
 def find_plate_type(items):
     """Return a plate classification such as Trailer when printed on the plate."""
     for item in items:
+        alnum = compact(item["text"])
+        if re.match(r"^TR[A4][I14L]L[E3]?R?$", alnum):
+            return "Trailer"
         cleaned = re.sub(r"[^A-Z]", "", item["text"].upper())
         if cleaned in PLATE_TYPES:
             return PLATE_TYPES[cleaned]
@@ -567,67 +723,110 @@ def find_plate_type(items):
     return None
 
 
+def _is_non_number_text(text, letters, feedback=None):
+    """Return True when a candidate is a state header, plate type, sticker date, or rejected token."""
+    if feedback:
+        rejected = feedback.get("rejected_tokens") or {}
+        if letters in rejected:
+            return True
+        for v_entry in (feedback.get("verified_plates") or {}).values():
+            if letters in (v_entry.get("sticker_numbers") or []):
+                return True
+    if letters in STATE_NAMES or letters in PLATE_TYPES or letters in TEXAS_COUNTIES:
+        return True
+    for name in STATE_NAMES:
+        if len(name) >= 5 and name in letters:
+            return True
+    for kind in PLATE_TYPES:
+        if len(kind) >= 5 and kind in letters:
+            return True
+    if re.match(r"^[TF7][EF][X4][A49][S5]", letters):
+        return True
+    if re.match(r"^[TY]R?[A4][I14L]L[E3]?R", letters):
+        return True
+    if re.search(r"\b\d{2}$", text.strip()) and len(letters) <= 7:
+        return True
+    return False
+
+
 def _clean_shown_number(text):
     """Strip stray bracket/quote OCR artifacts and normalize separator silhouettes."""
-    cleaned = text.strip("[](){}'\".,:;!? ").replace(",", "-")
+    cleaned = text.strip("[](){}'\".,:;!?+-*/\\ ").replace(",", "-")
     token = compact(cleaned)
-    # On lower-resolution crops, the center state-silhouette separator between 3 digits
-    # and 4 characters (e.g. '291 [TX] 764M') can be read as an 8th character.
     if len(token) == 8 and "-" not in cleaned and re.match(r"^\d{3}[01479IS]\d{3}[A-Z]$", token):
         return f"{token[:3]}-{token[4:]}"
+    if re.match(r"^\d{3}[^A-Z0-9]+\d{3}[A-Z]$", cleaned):
+        return f"{token[:3]}-{token[3:]}"
     return cleaned
 
 
-def number_score(row):
+def _feedback_multiplier(letters, feedback):
+    """Boost candidate score when a token matches or closely resembles a human-verified plate."""
+    if not feedback:
+        return 1.0
+    verified = feedback.get("verified_plates") or {}
+    if letters in verified:
+        return 1.40
+    for norm_key, entry in verified.items():
+        if letters in (entry.get("aliases") or []):
+            return 1.35
+        if ocr_similarity(letters, norm_key) >= 0.84:
+            return 1.28
+    return 1.0
+
+
+def number_score(row, feedback=None):
     """Score a text line as a plate number. Higher is a better candidate."""
     text = _clean_shown_number(join_row(row))
     letters = compact(text)
     if not 5 <= len(letters) <= 8:
         return -1
-    if letters in STATE_NAMES or letters in PLATE_TYPES:
+    if _is_non_number_text(text, letters, feedback):
         return -1
     if not any(character.isdigit() for character in letters):
         return -1
-    score = row["h"] * max(item.get("priority", 1) for item in row["items"])
+    score = row["h"] * max(item.get("priority", 1.0) for item in row["items"])
     if any(character.isalpha() for character in letters):
         score *= 1.25
     if 6 <= len(letters) <= 7:
         score *= 1.15
     if "-" in text:
         score *= 1.10
+    score *= _feedback_multiplier(letters, feedback)
     return score
 
 
-def item_number_score(item):
+def item_number_score(item, feedback=None):
     """Score one word by itself, so a single '291-764M' token can win."""
     text = _clean_shown_number(item["text"])
     letters = compact(text)
     if not 5 <= len(letters) <= 8:
         return -1
-    if letters in STATE_NAMES or letters in PLATE_TYPES:
+    if _is_non_number_text(text, letters, feedback):
         return -1
     if not any(character.isdigit() for character in letters):
         return -1
     if not any(character.isalpha() for character in letters):
         return -1
-    score = item["h"] * item.get("priority", 1) * 1.25
+    score = item["h"] * item.get("priority", 1.0) * 1.25
     if 6 <= len(letters) <= 7:
         score *= 1.15
     if "-" in text:
         score *= 1.10
+    score *= _feedback_multiplier(letters, feedback)
     return score
 
 
-def find_number(rows, items):
+def find_number(rows, items, feedback=None):
     """Pick the plate number from whole lines and from single words."""
     candidates = []
     for row in rows:
-        score = number_score(row)
+        score = number_score(row, feedback)
         if score > 0:
             shown = _clean_shown_number(join_row(row))
             candidates.append((score, shown, compact(shown), row["items"]))
     for item in items:
-        score = item_number_score(item)
+        score = item_number_score(item, feedback)
         if score > 0:
             shown = _clean_shown_number(item["text"])
             candidates.append((score, shown, compact(shown), [item]))
@@ -668,7 +867,6 @@ def find_sticker_details(rows, items, number_height, normalized_number):
                     if prev_token.isdigit() and 1 <= int(prev_token) <= 12:
                         month = f"{int(prev_token):02d}"
                     elif prev_token in {"ALL", "LL", "II", "I1", "1I"} or prev_token.endswith("LL"):
-                        # On Texas stickers, the state silhouette beside '11' often OCRs as 'ALL'
                         month = "11"
                 expiration = f"{month}/{token}" if month else f"20{token}"
 
@@ -687,6 +885,261 @@ def find_sticker_details(rows, items, number_height, normalized_number):
             serials.append(token)
 
     return expiration, serials
+
+
+def _apply_learned_memory(reading, feedback):
+    """Use human-verified plate memory to repair noisy OCR reads and backfill blurry contents."""
+    norm = reading.get("normalized")
+    if not norm or not feedback:
+        return reading
+    verified = feedback.get("verified_plates") or {}
+    matched_key = None
+    match_sim = 0.0
+    if norm in verified:
+        matched_key = norm
+        match_sim = 1.0
+    else:
+        best_key, best_sim = None, 0.0
+        for v_key, entry in verified.items():
+            if norm in (entry.get("aliases") or []):
+                best_key, best_sim = v_key, 0.96
+                break
+            sim = ocr_similarity(norm, v_key)
+            if sim > best_sim:
+                best_key, best_sim = v_key, sim
+        if best_key and best_sim >= 0.84:
+            matched_key = best_key
+            match_sim = best_sim
+
+    if not matched_key:
+        return reading
+
+    learned = verified[matched_key]
+    reading["verified_match"] = matched_key
+    reading["verified_similarity"] = round(match_sim, 3)
+    reading["human_confirmations"] = int(learned.get("confirmations", 1))
+    if norm != matched_key or reading["number"] != learned.get("number", reading["number"]):
+        reading["raw_ocr_number"] = reading["number"]
+        reading["number"] = learned.get("number") or reading["number"]
+        reading["normalized"] = matched_key
+
+    backfilled = []
+    for field in ("state", "county", "plate_type", "slogan", "expiration"):
+        if not reading.get(field) and learned.get(field):
+            reading[field] = learned[field]
+            backfilled.append(field)
+    if reading.get("state") and not reading.get("country"):
+        reading["country"] = "United States"
+    if not reading.get("sticker_numbers") and learned.get("sticker_numbers"):
+        reading["sticker_numbers"] = list(learned["sticker_numbers"])
+        backfilled.append("sticker_numbers")
+    if backfilled:
+        reading["learned_backfill"] = backfilled
+    return reading
+
+
+def compute_confidence(reading, items, image=None):
+    """Calculate a 0-100% accuracy confidence score and factor breakdown for the plate reading.
+
+    Combines 5 signals:
+      1. Multi-Pass OCR Agreement (up to 35 pts)
+      2. Plate Format & Pattern Structure (up to 25 pts)
+      3. Contextual Contents Corroboration (up to 20 pts)
+      4. Visual Contrast & Edge Sharpness (up to 10 pts)
+      5. Human-in-the-Loop Feedback Bonus (up to +15 pts)
+    """
+    norm = reading.get("normalized")
+    if not norm:
+        return 0.0, "None", {
+            "agreement": 0.0,
+            "format": 0.0,
+            "context": 0.0,
+            "clarity": 0.0,
+            "human_feedback": 0.0,
+        }
+
+    # 1. Multi-Pass OCR Agreement (max 35.0)
+    agreeing_passes = set()
+    for item in reading.get("number_items") or []:
+        agreeing_passes.update(item.get("passes") or {item.get("pass_name", "raw")})
+    for item in items:
+        if ocr_similarity(compact(item["text"]), norm) >= 0.85:
+            agreeing_passes.update(item.get("passes") or {item.get("pass_name", "raw")})
+    pass_count = len(agreeing_passes)
+    if pass_count >= 3:
+        agreement_pts = 35.0
+    elif pass_count == 2:
+        agreement_pts = 28.0
+    else:
+        agreement_pts = 18.0
+
+    # 2. Alphanumeric Format & Pattern Validity (max 25.0)
+    shown = reading.get("number") or norm
+    format_pts = 0.0
+    if 6 <= len(norm) <= 7:
+        format_pts += 10.0
+    elif 5 <= len(norm) <= 8:
+        format_pts += 6.0
+    if any(c.isdigit() for c in norm) and any(c.isalpha() for c in norm):
+        format_pts += 6.0
+    if re.match(r"^[A-Z0-9]{2,4}-[A-Z0-9]{3,4}$", shown):
+        format_pts += 9.0
+    elif re.match(r"^[A-Z0-9]{6,7}$", shown):
+        format_pts += 7.0
+    else:
+        format_pts += 3.0
+    if reading.get("raw_ocr_number"):
+        # Slightly lower raw format points when repaired from a noisy OCR frame
+        format_pts = max(12.0, format_pts - 4.0)
+
+    # 3. Contextual Plate Contents Corroboration (max 20.0)
+    backfilled = set(reading.get("learned_backfill") or [])
+    context_pts = 0.0
+    if reading.get("state") and "state" not in backfilled:
+        context_pts += 7.0
+    if reading.get("plate_type") and "plate_type" not in backfilled:
+        context_pts += 4.0
+    if reading.get("slogan") and "slogan" not in backfilled:
+        context_pts += 4.0
+    if (reading.get("county") and "county" not in backfilled) or (
+        reading.get("expiration") and "expiration" not in backfilled
+    ):
+        context_pts += 5.0
+
+    # 4. Visual Sharpness & Local Contrast (max 10.0)
+    clarity_pts = 7.0
+    num_items = reading.get("number_items") or []
+    if image is not None and num_items:
+        ih, iw = image.shape[:2]
+        x0 = max(0, int(min(it["x"] for it in num_items)))
+        y0 = max(0, int(min(it["y"] for it in num_items)))
+        x1 = min(iw, int(max(it["x"] + it["w"] for it in num_items)))
+        y1 = min(ih, int(max(it["y"] + it["h"] for it in num_items)))
+        if x1 - x0 >= 20 and y1 - y0 >= 12:
+            gray = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+            contrast = min(5.0, float(np.std(gray)) / 11.0)
+            gx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
+            sharpness = min(
+                5.0,
+                float(np.mean(cv2.convertScaleAbs(gx)) + np.mean(cv2.convertScaleAbs(gy))) / 18.0,
+            )
+            clarity_pts = round(contrast + sharpness, 1)
+
+    # 5. Human-in-the-Loop Feedback Bonus (up to +15.0)
+    confirmations = int(reading.get("human_confirmations", 0))
+    feedback_pts = 0.0
+    if confirmations > 0:
+        sim = float(reading.get("verified_similarity", 1.0))
+        base_boost = 8.0 if sim >= 0.99 else 6.0
+        feedback_pts = min(15.0, round(base_boost + min(7.0, (confirmations - 1) * 1.5), 1))
+
+    total = min(
+        99.9,
+        round(agreement_pts + format_pts + context_pts + clarity_pts + feedback_pts, 1),
+    )
+    if total >= 90.0:
+        level = "Verified High" if confirmations > 0 else "High"
+    elif total >= 75.0:
+        level = "Good"
+    elif total >= 55.0:
+        level = "Moderate (Needs Human Check)"
+    else:
+        level = "Low (Uncertain)"
+
+    details = {
+        "agreement": round(agreement_pts, 1),
+        "agreeing_passes": sorted(agreeing_passes),
+        "format": round(format_pts, 1),
+        "context": round(context_pts, 1),
+        "clarity": round(clarity_pts, 1),
+        "human_feedback": round(feedback_pts, 1),
+        "confirmations": confirmations,
+    }
+    return total, level, details
+
+
+def record_human_feedback(reading, items=None, is_correct=True, taught_number=None):
+    """Update datasets/plate_feedback.json from human confirmation, rejection, or teaching.
+
+    Returns the updated feedback dictionary and a short human-readable summary of what was learned.
+    """
+    feedback = load_feedback()
+    items = items or reading.get("all_items") or []
+
+    if not is_correct and not taught_number:
+        bad_norm = reading.get("normalized")
+        if not bad_norm:
+            return feedback, "No plate number was present to reject."
+        rejected = feedback.setdefault("rejected_tokens", {})
+        rejected[bad_norm] = int(rejected.get(bad_norm, 0)) + 1
+        verified = feedback.get("verified_plates") or {}
+        if bad_norm in verified:
+            del verified[bad_norm]
+        save_feedback(feedback)
+        return (
+            feedback,
+            f"Rejected '{reading.get('number') or bad_norm}' — added '{bad_norm}' to rejected tokens so the algorithm will ignore it.",
+        )
+
+    shown_number = _clean_shown_number(taught_number) if taught_number else reading.get("number")
+    norm_number = compact(shown_number or "")
+    if not norm_number:
+        return feedback, "No valid plate number to confirm."
+
+    # Remove from rejected list if previously rejected
+    feedback.get("rejected_tokens", {}).pop(norm_number, None)
+
+    verified = feedback.setdefault("verified_plates", {})
+    entry = verified.get(
+        norm_number,
+        {
+            "number": shown_number,
+            "confirmations": 0,
+            "aliases": [],
+        },
+    )
+    entry["number"] = shown_number
+    entry["confirmations"] = int(entry.get("confirmations", 0)) + 1
+
+    for field in ("state", "county", "plate_type", "slogan", "expiration"):
+        if reading.get(field):
+            entry[field] = reading[field]
+    if reading.get("sticker_numbers"):
+        entry["sticker_numbers"] = list(reading["sticker_numbers"])
+
+    # Learn OCR aliases from any noisy 5-8 char tokens seen in the image
+    aliases = set(entry.get("aliases") or [])
+    if reading.get("raw_ocr_number"):
+        raw_norm = compact(reading["raw_ocr_number"])
+        if raw_norm and raw_norm != norm_number:
+            aliases.add(raw_norm)
+    if reading.get("normalized") and reading["normalized"] != norm_number:
+        aliases.add(reading["normalized"])
+    for item in items:
+        cand = compact(item.get("text", ""))
+        if 5 <= len(cand) <= 9 and cand != norm_number:
+            if not _is_non_number_text(item.get("text", ""), cand) and ocr_similarity(
+                cand, norm_number
+            ) >= 0.68:
+                aliases.add(cand)
+    entry["aliases"] = sorted(aliases)
+    verified[norm_number] = entry
+
+    # Reward enhancement passes that contributed to the winning plate reading
+    weights = feedback.setdefault("pass_weights", dict(DEFAULT_PASS_WEIGHTS))
+    winning_passes = set()
+    for item in reading.get("number_items") or []:
+        winning_passes.update(item.get("passes") or {item.get("pass_name", "raw")})
+    for pass_name in winning_passes:
+        if pass_name in weights:
+            weights[pass_name] = round(min(1.50, float(weights[pass_name]) + 0.05), 3)
+
+    save_feedback(feedback)
+    return (
+        feedback,
+        f"Confirmed '{shown_number}' (confirmations={entry['confirmations']}, learned aliases={len(entry['aliases'])}).",
+    )
 
 
 def collect_plate_contents(reading, rows):
@@ -720,10 +1173,12 @@ def collect_plate_contents(reading, rows):
     return contents
 
 
-def parse_plate(items):
-    """Turn OCR words into structured plate fields and all recognized plate contents."""
+def parse_plate(items, image=None, feedback=None):
+    """Turn OCR words into structured plate fields, learned corrections, and confidence score."""
+    if feedback is None:
+        feedback = load_feedback()
     rows = group_rows(items)
-    shown, normalized, number_items = find_number(rows, items)
+    shown, normalized, number_items = find_number(rows, items, feedback)
     number_height = max((item["h"] for item in number_items), default=0)
     state, slogan = find_state_and_slogan(rows, items)
     plate_type = find_plate_type(items)
@@ -756,15 +1211,21 @@ def parse_plate(items):
         "sticker_numbers": sticker_numbers,
         "number_items": number_items,
         "content_items": valid_items,
+        "all_items": items,
         "plate_box": plate_box,
     }
+    reading = _apply_learned_memory(reading, feedback)
     reading["contents"] = collect_plate_contents(reading, rows)
+    confidence, conf_level, conf_details = compute_confidence(reading, items, image)
+    reading["confidence"] = confidence
+    reading["confidence_level"] = conf_level
+    reading["confidence_details"] = conf_details
     return reading
 
 
 def _shift_reading(reading, dx, dy):
     """Translate a crop reading's coordinates back onto the parent image."""
-    for key in ("number_items", "content_items"):
+    for key in ("number_items", "content_items", "all_items"):
         for item in reading.get(key) or []:
             item["x"] += dx
             item["y"] += dy
@@ -775,40 +1236,45 @@ def _shift_reading(reading, dx, dy):
     return reading
 
 
-def read_plate_image(image):
+def read_plate_image(image, feedback=None):
     """Enhance and read one still photo. Returns the image and the parsed plate contents."""
-    reading = parse_plate(read_text(image))
+    if feedback is None:
+        feedback = load_feedback()
+    items = read_text(image, feedback)
+    reading = parse_plate(items, image=image, feedback=feedback)
     if reading["normalized"]:
         return image, reading
 
     # Fallback 1: run OCR on the full enhanced plate image
     enhanced = enhance_plate_image(image)
-    enh_reading = parse_plate(read_text(enhanced))
+    enh_items = read_text(enhanced, feedback)
+    enh_reading = parse_plate(enh_items, image=enhanced, feedback=feedback)
     if enh_reading["normalized"]:
         return image, enh_reading
 
     # Fallback 2: locate rectangular plate regions inside a wider scene
     for x0, y0, x1, y1 in detect_plate_regions(image):
-        crop_reading = parse_plate(read_text(image[y0:y1, x0:x1]))
+        crop = image[y0:y1, x0:x1]
+        crop_items = read_text(crop, feedback)
+        crop_reading = parse_plate(crop_items, image=crop, feedback=feedback)
         if crop_reading["normalized"]:
             return image, _shift_reading(crop_reading, x0, y0)
     return image, reading
 
 
 def read_plate_in_frame(image, vehicle_boxes=None):
-    """Read a plate from a camera frame using fast plate localization and enhancement."""
-    # First check rectangular plate candidates detected directly in the frame
+    """Read a plate from a camera frame using fast plate localization, enhancement, and learned memory."""
+    feedback = load_feedback()
     for x0, y0, x1, y1 in detect_plate_regions(image):
-        candidate = parse_plate(read_text(image[y0:y1, x0:x1]))
+        crop = image[y0:y1, x0:x1]
+        candidate = parse_plate(read_text(crop, feedback), image=crop, feedback=feedback)
         if candidate["normalized"]:
             return _shift_reading(candidate, x0, y0)
 
-    # Next check the full frame (handles a plate held close to the camera)
-    reading = parse_plate(read_text(image))
+    reading = parse_plate(read_text(image, feedback), image=image, feedback=feedback)
     if reading["normalized"] or not vehicle_boxes:
         return reading
 
-    # Finally check the lower bumper area of any detected vehicles
     height, width = image.shape[:2]
     for x0, y0, x1, y1 in vehicle_boxes[:2]:
         x0, y0 = max(0, int(x0)), max(0, int(y0))
@@ -816,7 +1282,8 @@ def read_plate_in_frame(image, vehicle_boxes=None):
         crop_y0 = y0 + int((y1 - y0) * 0.40)
         if x1 - x0 < 40 or y1 - crop_y0 < 30:
             continue
-        candidate = parse_plate(read_text(image[crop_y0:y1, x0:x1]))
+        crop = image[crop_y0:y1, x0:x1]
+        candidate = parse_plate(read_text(crop, feedback), image=crop, feedback=feedback)
         if candidate["normalized"]:
             return _shift_reading(candidate, x0, crop_y0)
     return reading
@@ -878,7 +1345,7 @@ def vehicle_crops(image):
 
 
 def annotate(image, reading):
-    """Draw boxes around the plate contents, plate number, and a summary header."""
+    """Draw boxes around the plate contents, plate number, and a summary header with confidence."""
     canvas = image.copy()
     for item in reading.get("content_items") or []:
         ix0, iy0 = int(item["x"]), int(item["y"])
@@ -894,7 +1361,9 @@ def annotate(image, reading):
 
     label_parts = []
     if reading["normalized"]:
-        label_parts.append(reading["number"] or reading["normalized"])
+        num_str = reading["number"] or reading["normalized"]
+        conf = reading.get("confidence", 0.0)
+        label_parts.append(f"{num_str} ({conf:.1f}%)")
     if reading.get("plate_type"):
         label_parts.append(reading["plate_type"])
     if reading["county"]:
@@ -906,7 +1375,7 @@ def annotate(image, reading):
     if label_parts:
         label = " | ".join(label_parts)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.85
+        scale = 0.82
         thickness = 2
         (text_width, text_height), baseline = cv2.getTextSize(label, font, scale, thickness)
         x, y = 12, text_height + 16
@@ -937,12 +1406,34 @@ def save_image(path, image, suffix_tag=""):
 
 
 def describe(path, reading):
-    """Print the plate number, issuing place, type, slogan, sticker info, and all contents."""
+    """Print the plate number, confidence score breakdown, and all recognized plate contents."""
     print(path.relative_to(ROOT))
     if reading["normalized"]:
-        print(f"  Plate number: {reading['number']}")
+        extra = ""
+        if reading.get("raw_ocr_number"):
+            extra = f" (auto-corrected from noisy OCR '{reading['raw_ocr_number']}' via learned memory)"
+        print(f"  Plate number: {reading['number']}{extra}")
     else:
         print("  Plate number: not found")
+
+    conf = reading.get("confidence", 0.0)
+    level = reading.get("confidence_level", "None")
+    details = reading.get("confidence_details") or {}
+    if reading["normalized"]:
+        passes_str = ", ".join(details.get("agreeing_passes") or [])
+        print(f"  Confidence score: {conf:.1f}% ({level})")
+        print(
+            f"    - OCR pass agreement: {details.get('agreement', 0.0):.1f}/35.0 pts "
+            f"({len(details.get('agreeing_passes') or [])} passes: {passes_str})"
+        )
+        print(f"    - Plate format validity: {details.get('format', 0.0):.1f}/25.0 pts")
+        print(f"    - Contextual contents match: {details.get('context', 0.0):.1f}/20.0 pts")
+        print(f"    - Image clarity & contrast: {details.get('clarity', 0.0):.1f}/10.0 pts")
+        print(
+            f"    - Human feedback boost: +{details.get('human_feedback', 0.0):.1f}/15.0 pts "
+            f"(confirmations: {details.get('confirmations', 0)})"
+        )
+
     if reading["state"]:
         location = reading["state"]
         if reading["county"]:
@@ -963,7 +1454,7 @@ def describe(path, reading):
 
 
 def main():
-    """Enhance and read every requested photo, or every photo in the plate folders."""
+    """Enhance and read every requested photo, compute confidence, and apply any human feedback."""
     args = parse_args()
     if args.images:
         paths = [resolve_inside_project(path) for path in args.images]
@@ -988,6 +1479,19 @@ def main():
                 if crop_reading["normalized"]:
                     canvas, reading = crop_canvas, crop_reading
                     break
+
+        if args.confirm or args.reject or args.teach:
+            if args.reject:
+                updated_fb, msg = record_human_feedback(reading, is_correct=False)
+                print(f"  [Human Feedback] {msg}")
+                canvas, reading = read_plate_image(image, feedback=updated_fb)
+            else:
+                updated_fb, msg = record_human_feedback(
+                    reading, is_correct=True, taught_number=args.teach
+                )
+                print(f"  [Human Feedback] {msg}")
+                canvas, reading = read_plate_image(image, feedback=updated_fb)
+
         describe(path, reading)
         enhanced_saved = save_image(path, enhance_plate_image(canvas), suffix_tag="_enhanced")
         saved = save_image(path, annotate(canvas, reading))
